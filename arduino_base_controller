@@ -1,0 +1,336 @@
+#include "/home/lh/mavlink/ourcar/mavlink.h"
+
+#define kp 0.05;  //PID参数，如果需要减少从0→低速时的猛冲抖动，可以减小，但是效果不明显
+#define ki 0
+#define kd 0
+
+#define TIMEOUT_RECEIVING 500 //命令接收过程中等待时间
+#define TIMEOUT_RECEIVE 2000  //命令接收间隔最大时间，超过此时间没有接收到命令就停机
+#define FEEDBACK_REFRESH 250  //速度反馈时间间隔（实际值会比这个大50-100ms，不知为何）
+#define PID_REFRESH_TIME 20000  //PID控制最大时间间隔（μs）
+#define PID_FAST_SINGALS 20   //高速时间隔以编码盘信号数为PID输出频率依据
+#define PID_GAP_CHASING 2000  //目标速度与当前速度大于此值时，以PID_CHASING_OUTPUT输出追赶。小车上不采用，因此取大值
+#define PID_GAP_OPPO_CHASING 80 //目标速度与当前速度反向时，如果当前速度绝对值大于此值，电机停机等待
+#define PID_GAP_ENGINE_STOP 3000//当前速度大于目标速度时，如果大于此值，电机停机，小车上不采用，取大值
+#define PID_CHASING_OUTPUT 200  //差距过大时的追赶输出，阻力小时不建议255
+
+const int pinpo[4]={39,36,35,33};
+const int pinmi[4]={38,37,34,32}; //电机控制口,pinpo输出HIGH表示正传
+const int speedpin[4]={6,5,9,11}; //PWM控制
+
+const int mbpin1 = 28;        //B相端口
+const int mbpin2 = 26;
+const int mbpin3 = 22;
+const int mbpin4 = 24;
+
+const float R = 0.03;     //轮子半径 单位都为 m
+const float L1 = 0.08;    //左右两轮中心距的1/2
+const float L2 = 0.09;    //前后轮轴间距的1/2
+const float L12 = L1 +L2;
+
+volatile int r[4] = {0,0,0,0};   //编码盘的计次数
+unsigned int r_last[4] = {0,0,0,0};     //记录上一次编码盘的值
+
+bool motororder[4];
+int output[4];
+int waim[4];
+float wnow[4];
+
+
+bool new_order = 0;
+unsigned long moment_last_order;
+unsigned long moment_last_pid[4];
+unsigned long begintime_last_feedback;    //这些用于记录上次对应操作的时刻
+mavlink_movecontrol_t speed_order;
+int action = 1;
+
+//中断函数，其中13 24 同号
+void wheel_0() {
+    if ( digitalRead(mbpin1) )
+        r[0]--;
+    else
+        r[0]++;
+    return;
+}
+
+void wheel_1() {
+    if ( digitalRead(mbpin2) )
+        r[1]++;
+    else
+        r[1]--;
+    return;
+}
+
+void wheel_2() {
+    if ( digitalRead(mbpin3) )
+        r[2]--;
+    else
+        r[2]++;
+    return;
+}
+
+void wheel_3() {
+    if ( digitalRead(mbpin4) )
+        r[3]++;
+    else
+        r[3]--;
+    return;
+}
+
+//PID程序 输入以信号/s为单位的目标速度与当前速度，以及PWM输出
+void MYPID ( const int waim, const int wnow, int &output ) {
+  //防止停止命令时PID依旧有小PWM输出，判断目标是否为0
+    if ( waim == 0) {
+    output = 0;
+    return;
+  }
+
+  //如果反向，判断是否接近0，否则停止等待以保护电机
+    if ( (waim>0 && wnow<0) || (waim<0 && wnow>0) ) {
+        if ( abs(wnow) > PID_GAP_OPPO_CHASING) {
+            output = 0;
+            return;
+        } else {
+            output = PID_CHASING_OUTPUT;
+            return;
+        }
+    }
+
+    int GAP = abs(waim) - abs(wnow);
+
+  //最后一组判断，目标速度与当前速度是否接近，否则全速追赶或停机，小车上无用
+    if (GAP > PID_GAP_CHASING) {
+        output = PID_CHASING_OUTPUT;
+        return;
+    }
+    if ( GAP < -PID_GAP_ENGINE_STOP) {
+        output = 0;
+        return;
+    }
+  
+  //实际的PID操作，仅有P控制
+    int plu = GAP * kp;
+    output += plu;
+
+  //输出修正，因为占比<80电机将不转
+    if ( output > 255)
+        output = 255;
+    if (output < 15)
+        output = 0;
+    else if ( output < 80)
+        output = 80;
+
+}
+
+void setup() {
+    pinMode(mbpin1,INPUT_PULLUP); //B相为INPUT
+    pinMode(mbpin2,INPUT_PULLUP);
+    pinMode(mbpin3,INPUT_PULLUP);
+    pinMode(mbpin4,INPUT_PULLUP);
+    for (char i = 0; i<4; i++)
+    {
+      pinMode( pinpo[i], OUTPUT);
+      pinMode( pinmi[i], OUTPUT);
+      pinMode( speedpin[i], OUTPUT);
+    }
+
+    attachInterrupt(0,wheel_0, FALLING);    //pin 2  https://www.arduino.cc/en/Reference/AttachInterrupt
+    attachInterrupt(1,wheel_1, FALLING);    //pin 3
+    attachInterrupt(4,wheel_2, FALLING);    //pin 19
+    attachInterrupt(5,wheel_3, FALLING);  //pin 18
+
+    Serial.begin(57600);
+    Serial.println("start");
+
+    moment_last_order = millis();
+    for (int i = 0; i < 4; i++) {
+        moment_last_pid[i] = micros();
+    }
+    begintime_last_feedback = millis(); //将几个时刻量初始化
+}
+
+void receive_action( int &action) {   //接收MAVLINK Action信息，没有timeout，备用
+    mavlink_message_t msg;
+    mavlink_status_t mav_status;
+    bool flag_action = 1;
+    while (flag_action) {
+        if ( Serial.available() > 0) {
+            unsigned char c = Serial.read();
+            if ( mavlink_parse_char( MAVLINK_COMM_0, c, &msg, &mav_status))
+            {
+                if ( msg.msgid == MAVLINK_MSG_ID_action) {
+                    flag_action = 0;
+                    action = mavlink_msg_action_get_action( &msg);
+                }
+            }
+        }
+    }
+}
+
+void receive_speed (mavlink_movecontrol_t &speed_order) {   //接收movecontrol命令，没有timeout，备用
+    mavlink_message_t msg;
+    mavlink_status_t mav_status;
+    bool flag_speed = 1;
+    while (flag_speed) {
+        if ( Serial.available() > 0) {
+            unsigned char c = Serial.read();
+            if  ( mavlink_parse_char( MAVLINK_COMM_1, c, &msg, &mav_status))
+            {
+                if ( msg.msgid == MAVLINK_MSG_ID_movecontrol ) {
+                    flag_speed = 0;
+                    mavlink_msg_movecontrol_decode( &msg, &speed_order);
+                    speed_order.vx -= 1;
+                }
+            }
+        }
+    }
+}
+
+void receive_order () {     //接收action以及movecontrol命令，有timeout，实际使用
+    mavlink_message_t msg;
+    mavlink_status_t mav_status;
+    bool getmsg = 0;      //接收命令flag
+    bool timeout_receive = 0; //timeout布尔开关
+    unsigned long begintime_receive = millis(); //开始接收命令的时刻
+    unsigned char c;
+    while( (getmsg == 0) && (timeout_receive == 0)) { //当信息没有接收到并且没有timeout时运行
+        if (Serial.available() > 0) {         //检查串口缓存，如果没有就read会读到0
+           c = Serial.read();
+           if ( mavlink_parse_char( MAVLINK_COMM_0, c, &msg, &mav_status))  //mavlink信息拼接完成？
+           {
+               switch (msg.msgid) {           //是什么msg？
+               case MAVLINK_MSG_ID_action: {
+                   action = mavlink_msg_action_get_action( &msg);
+                   if (action == 1)           //命令是1么？如果是的话就没有movecontrol了
+                       getmsg = 1;
+                   break;
+               }
+               case MAVLINK_MSG_ID_movecontrol :{
+                   mavlink_msg_movecontrol_decode( &msg, &speed_order);
+                   speed_order.vx -= 1;         //切记vx传输前人为+1
+                   getmsg = 1;
+                   new_order = 1;           //新命令flag竖起
+                   break;
+               }
+               default:
+                   break;
+               }
+           }
+        }
+        if ((millis() - begintime_receive) > TIMEOUT_RECEIVING) { //超时？
+            timeout_receive = 1;
+            action = 1;
+        }
+    }
+}
+
+void loop() {
+    if (Serial.available() > 0) {       //串口有数据？
+        receive_order();
+        moment_last_order = millis();     //设定上次接收到数据的时刻
+    }
+
+    if ((millis() - moment_last_order) > TIMEOUT_RECEIVE) { //很久没有接收到数据了？
+        action = 1;
+    }
+
+    if (action == 1) {              //action是1，直接停机，不PID
+        for (int i = 0; i < 4; i++) {
+            output[i] = 0;
+            analogWrite(speedpin[i], output[i]);
+        }
+        int r_stop[4];
+        for ( int i = 0; i < 4; i++) {
+            r_stop[i] = r[i];
+        }
+        delay(100);
+        for ( int i = 0; i < 4; i++) {
+            wnow[i] = (r[i] - r_stop[i]) * 10.0;//但是要刷新当前速度
+        }
+    } else {
+        if (new_order) {            //有新命令？ 赋值
+            float vx = speed_order.vx;
+            float vy = speed_order.vy;
+            float w0 = speed_order.vz;
+            waim[0] = (vx + vy - L12 * w0) * 59.52 / R;
+            waim[1] = (vx - vy + L12 * w0) * 59.52 / R;
+            waim[2] = (vx - vy - L12 * w0) * 59.52 / R;
+            waim[3] = (vx + vy + L12 * w0) * 59.52 / R;
+            for ( int i = 0; i < 4; i++) {
+                if (waim[i] < 0)
+                    motororder[i] = 0;
+                else
+                    motororder[i] = 1;
+            }
+            new_order = 0;
+        }
+        bool pid_done[4] = {0,0,0,0};     //无论如何必须所有电机进行一次PID输出
+        bool all_pid_done = 0;          //总flag
+        while (!all_pid_done) {
+            for ( int i = 0; i < 4; i++) {    
+                int delta_r = r[i] - r_last[i];   //看一下距上一次编码盘信号刷新了多少？
+                if (micros() < moment_last_pid[i])  //因为采用的是micros，溢出为70分钟，保险起见做一次检查
+                    moment_last_pid[i] = 0;
+                float delta_t = micros() - moment_last_pid[i];//距离上一次PID输出过了多久（每个电机单独考虑）
+                if ((delta_r > PID_FAST_SINGALS) || (delta_t > PID_REFRESH_TIME)) { //信号增量大或者过一定时间都会进入PID输出程序
+                        wnow[i] = (float)(delta_r) * 1000000.0f / delta_t;      //计算当前速度，注意用的时micros
+
+                        MYPID( waim[i], wnow[i], output[i]);
+                        digitalWrite( pinpo[i], motororder[i]);
+                        digitalWrite( pinmi[i], !motororder[i]);
+                        analogWrite(speedpin[i], output[i]);
+
+                        moment_last_pid[i] = micros();    //记录上次PID输出的时间
+                        if ( abs( r[i]) > 30000)      //r是否要int溢出了？
+                            r[i] = 0;
+                        r_last[i] = r[i];
+                        pid_done[i] = 1;          //本电机已经做过一次PID了
+                }
+            }
+            all_pid_done = pid_done[0] && pid_done[1] && pid_done[2] && pid_done[3]; //是否都PID输出了？
+        }
+    }
+
+    if (millis() - begintime_last_feedback > FEEDBACK_REFRESH) {  //距离上次汇报过了多久？
+//      int passtime = millis() - begintime_last_feedback;
+        begintime_last_feedback = millis();             //记录这次反馈的时刻
+        static mavlink_state_t feedback;
+        feedback.flag = 1;                      //防止都是0
+        feedback.vx = R * (wnow[2] + wnow[3]) * 0.0084;
+        feedback.vy = R * (wnow[0] - wnow[2]) * 0.0084;
+        feedback.vz = R * (wnow[3] - wnow[0]) * 0.0084 / L12;   //换算为国际单位值并放入state结构体
+//feedback.vx = output[0];
+//feedback.vy = output[1];
+//feedback.vz = output[2];
+//feedback.state = output[3];
+        static mavlink_message_t msg_feedback;
+        mavlink_msg_state_encode( 100, 200, &msg_feedback, &feedback);
+        static unsigned char buf [100];
+        int len = mavlink_msg_to_send_buffer( buf, &msg_feedback);
+        Serial.write( buf, len);                  //编码，发送
+//for ( int i = 0; i < 4; i++) {
+//  Serial.print(waim[i]);
+//  Serial.print("\t");
+//}
+//Serial.println(" ");
+//for ( int i = 0; i < 4; i++) {
+//  Serial.print(wnow[i]);
+//  Serial.print("\t");
+//}
+//Serial.println(" ");
+//for ( int i = 0; i < 4; i++) {
+//  Serial.print(output[i]);
+//  Serial.print("\t");
+//}
+//Serial.println(" ");
+//Serial.println(" ");
+    }
+}
+
+
+
+
+
+
+
+
